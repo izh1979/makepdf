@@ -1,0 +1,12 @@
+[submodule "pdfsizeopt"]
+	path = pdfsizeopt
+	url = git@github.com:pts/pdfsizeopt.git
+[submodule "pdfsizeopt-jbig2"]
+	path = pdfsizeopt-jbig2
+	url = git@github.com:pts/pdfsizeopt-jbig2.git
+[submodule "tif22pnm"]
+	path = tif22pnm
+	url = git@github.com:pts/tif22pnm.git
+[submodule "sam2p"]
+	path = sam2p
+	url = git@github.com:pts/sam2p.git

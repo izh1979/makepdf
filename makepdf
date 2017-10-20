@@ -1,0 +1,517 @@
+#!/usr/bin/php
+<?php
+/*
+Copyright 2015-2017 Igor Zhbanov <izh1979@gmail.com>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+$mail_to = "John Doe <j.doe@example.com>";
+$mail_from = "Example hosting whatwgpdf.php <pdf-generator@example.com>";
+$mail_subject_prefix = "Example hosting whatwg.php";
+
+$LOG_DIR = "/var/log/makepdf";
+$LOG_FILE = "$LOG_DIR/html5-whatwg.log";
+/* Used for logging full URLs. Should not end with '/'. */
+$SITE_URL = "http://example.com";
+$TTL = 30 * 60; /* The script's maximal Time To Live: 30 minutes */
+$server_timezone = "Europe/Moscow";
+
+$PRINCE = "/usr/local/bin/prince";
+$MULTIVALENT = "/opt/pdfsizeopt/Multivalent.jar";
+$PDFSIZEOPT = "/opt/pdfsizeopt/pdfsizeopt";
+$PDFSIZEOPT_OPTS = "--use-pngout=true --use-jbig2=true --use-multivalent=false";
+
+/* Web-site root directory. Must start with '/'. */
+$SRV_DIR = "/srv/www/htdocs";
+/* PDFs export subdirectory. Must start with '/'. */
+$EXPORT_DIR = "/h/out";
+/* The full path of directory for exporting optimized PDFs */
+$OUT_DIR = "$SRV_DIR$EXPORT_DIR";
+/* Keeping only this number of generated files in output directory.
+ * Deleting excessive. */
+$MAX_OUTPUT_FILES = 10;
+
+$REPORT_REPLY = "DONE";
+/* The URL for reporting that generation of the PDF is finished */
+$REPORT_URL = "https://example.com/update-pdf.cgi";
+
+/* The URL of the source HTML document to be converted */
+$SOURCE_URL = "https://html.spec.whatwg.org/";
+
+/* ------------------------------------------------------------------------ */
+
+/* The array of prince's output messages to be ignored */
+$prince_skip = array(
+	"/usr/local/lib/prince/bin/prince: /usr/lib64/libcurl.so.4:",
+	"/usr/local/lib/prince/bin/prince: /usr/local/lib/prince/lib/libcurl.so.4:",
+	"prince: Loading document...",
+	"prince: loading document: ",
+	"prince: Applying style sheets...",
+	"prince: loading style sheet: ",
+	"prince: Preparing document...",
+	"prince: loading image: ",
+	"prince: used font: ",
+	"prince: loading font: ",
+	"prince: loading HTML5 input: ",
+	"prince: Converting document...",
+	"prince: Resolving cross-references...",
+	"prince: https://html5.org/tools/icons/chrome-android: warning: ",
+	"prince: https://html5.org/tools/icons/ios-safari: warning: ",
+	"prince: https://html5.org/tools/icons/android: warning: ",
+	"prince: https://html5.org/tools/icons/uc: warning: ",
+	"prince: https://html5.org/tools/icons/gecko-android: warning: ",
+	"prince: https://html5.org/tools/icons/internet-explorer-mobile: warning: ",
+	"prince: https://html5.org/tools/icons/opera-mini: warning: ",
+	"prince: https://html.spec.whatwg.org/: warning: unsupported properties: ",
+	"prince: https://resources.whatwg.org/standard.css: warning: unsupported properties: ",
+	"prince: https://html.spec.whatwg.org/images/content-venn.svg: warning: unsupported properties: ",
+	"prince: data URL: warning: unsupported properties: ",
+	"prince: Finished: success"
+);
+
+/* The array of pdfsizeopt's output messages to be ignored */
+$pdfsizeopt_skip = array(
+	"sam2p: Warning: SampleFormat: Opaque would be better than Gray1",
+	"This is sam2p ",
+	"Available Loaders: ",
+	"Available Appliers: ",
+	"Success.",
+	" In:                             ",
+	"Out:                             ",
+	"Chg: ",
+	"file:/",
+	"PDF 1.5, producer=",
+	"cleaned and modernized",
+	"additional compression may be possible with:",
+	"	 -compact",
+	"write => new length = ",
+	"pngout: Info: Copying optimized verion of ",
+	"pngout: Info: Using cached optimized version of "
+);
+
+/* The array of pdfsizeopt's output messages to be ignored in regex form */
+$pdfsizeopt_skip_regs = array(
+	"[0-9]+ objects ",
+	"info: ",
+	"sam2p: Notice: "
+);
+
+/* ------------------------------------------------------------------------ */
+
+define("ST_OK",			0);
+define("ST_GENERATION_ERROR",	1);
+define("ST_OPTIMIZATION_ERROR",	2);
+define("ST_NOTIFICATION_ERROR",	3);
+define("ST_ALREADY_RUNNING",	4);
+define("ST_INTERNAL_ERROR1",	5);
+define("ST_INTERNAL_ERROR2",	6);
+define("ST_INTERNAL_ERROR3",	7);
+define("ST_INTERNAL_ERROR4",	8);
+
+$statuses = array(
+	ST_OK			=> "OK: Task completed",
+	ST_GENERATION_ERROR	=> "Document generation error",
+	ST_OPTIMIZATION_ERROR	=> "Optimization error",
+	ST_NOTIFICATION_ERROR	=> "Notification error",
+	ST_ALREADY_RUNNING	=> "Already running",
+	ST_INTERNAL_ERROR1	=> "Internal error 1",
+	ST_INTERNAL_ERROR2	=> "Internal error 2",
+	ST_INTERNAL_ERROR3	=> "Internal error 3",
+	ST_INTERNAL_ERROR4	=> "Internal error 4"
+);
+
+/* ------------------------------------------------------------------------ */
+
+function
+flog($str)
+{
+	global $fh_log;
+
+	$args = func_get_args();
+	$format = array_shift($args);
+	$prefix = strftime("[%F %T] ");
+	fwrite($fh_log, $prefix. vsprintf($format, $args));
+}
+
+/* ------------------------------------------------------------------------ */
+
+function
+send_mail($mail_status, $mail_body)
+{
+	global $mail_to, $mail_from, $mail_subject_prefix;
+
+	$headers =	"From: $mail_from\r\n".
+			"MIME-Version: 1.0\r\n".
+			"Date: ". date("r"). "\r\n".
+			"Content-type: text/plain; charset=UTF-8\r\n";
+	mail($mail_to, "$mail_subject_prefix: $mail_status", $mail_body,
+	     $headers);
+}
+
+/* ------------------------------------------------------------------------ */
+
+define("GET", "GET");
+define("PUT", "PUT");
+define("POST", "POST");
+define("DELETE", "DELETE");
+
+$ch = false;
+
+/* ------------------------------------------------------------------------ */
+
+function
+header_func($url, $headers)
+{
+	global $h_array;
+
+	$h = rtrim($headers);
+	if ($h != "" && strstr($h, ": ")) {
+		list($header, $value) = explode(": ", $h);
+		$h_array[$header] = $value;
+	}
+
+	return strlen($headers);
+}
+
+/* ------------------------------------------------------------------------ */
+
+function
+http_close()
+{
+	global $ch;
+
+	if ($ch) {
+		curl_close($ch);
+		$ch = false;
+	}
+}
+
+/* ------------------------------------------------------------------------ */
+
+function
+http_req($method, $url, $data = false)
+{
+	global $h_array, $ch;
+
+	if (!$ch && !($ch = curl_init())) {
+		flog("Can't initialize curl.");
+		return array(NULL, false, NULL);
+	}
+
+	switch ($method) {
+		case POST:
+			curl_setopt($ch, CURLOPT_POST, 1);
+			if ($data)
+				curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+
+			break;
+		case PUT:
+			curl_setopt($ch, CURLOPT_PUT, 1);
+			break;
+		default: /* GET */
+			if ($data)
+				$url = sprintf("%s?%s", $url,
+					       http_build_query($data));
+	}
+
+	$options = array(CURLOPT_URL		=> $url,
+			 CURLOPT_HEADER		=> 0,
+			 CURLOPT_FAILONERROR	=> 0,
+			 CURLOPT_RETURNTRANSFER	=> 1,
+			 CURLOPT_HEADERFUNCTION	=> "header_func");
+	curl_setopt_array($ch, $options);
+//	curl_setopt($ch, CURLOPT_VERBOSE, 1);
+	$h_array = array();
+	$content = curl_exec($ch);
+	if (($err = curl_errno($ch))) {
+		flog("Can't process \"$url\". curl_errno: $err.");
+		return array(NULL, false, NULL);
+	}
+
+	$status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+	return array($content, $status, $h_array);
+}
+
+/* ------------------------------------------------------------------------ */
+
+function
+process_command_output($lines, $file_name, $skip, $skip_regs = "")
+{
+	global $LOG_DIR;
+
+	$lines_num = count($lines);
+	$regexp = "";
+	foreach ($skip as $s) {
+		if ($regexp != "")
+			$regexp .= "|";
+
+		$regexp .= preg_quote($s, "/");
+	}
+
+	if ($skip_regs != "")
+		foreach ($skip_regs as $s) {
+			if ($regexp != "")
+				$regexp .= "|";
+
+			$regexp .= $s;
+		}
+
+	$regexp = "/^($regexp)/";
+	$out = "";
+	foreach ($lines as $line)
+		if (!preg_match($regexp, $line))
+			$out .= "$line\n";
+
+	if ($out != "") {
+		$cmd_log = "$LOG_DIR/$file_name.log";
+		@unlink($cmd_log);
+		file_put_contents($cmd_log, $out);
+
+		$cmd_full_log = "$LOG_DIR/$file_name-full.log";
+		@unlink($cmd_full_log);
+		file_put_contents($cmd_full_log, implode("\n", $lines). "\n");
+		return false;
+	}
+
+	return true;
+}
+
+/* ------------------------------------------------------------------------ */
+
+function
+mkdtemp($prefix = "")
+{
+	for ($i = 0; $i < 100; $i++) {
+		$dname = sys_get_temp_dir(). "/$prefix".
+			 base_convert(mt_rand(), 10, 36).
+			 base_convert(mt_rand(), 10, 36).
+			 base_convert(mt_rand(), 10, 36);
+		if (!@mkdir($dname, 0700))
+			continue;
+
+		return $dname;
+	}
+
+	flog("Can't create a temporary directory.");
+	return false;
+}
+
+/* ------------------------------------------------------------------------ */
+
+function
+rrmdir($dir)
+{
+	if ($dir == "" || $dir == "/")
+		return;
+
+	foreach (glob("$dir/*") as $file)
+		if (is_file($file)) /* We don't expect anything else here */
+			@unlink($file);
+
+	@rmdir($dir);
+}
+
+/* ------------------------------------------------------------------------ */
+
+function
+init_log_and_lock()
+{
+	global $fh_log, $LOG_FILE;
+
+	if (($fh_log = @fopen($LOG_FILE, "a")) === false) {
+		echo "Can't open log.\n";
+		return ST_INTERNAL_ERROR1;
+	}
+
+	if (!flock($fh_log, LOCK_EX | LOCK_NB)) {
+		flog("Already running. Exiting.\n");
+		fclose($fh_log);
+		return ST_ALREADY_RUNNING;
+	}
+
+	return ST_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+
+function
+close_log_and_unlock()
+{
+	global $fh_log;
+
+	flock($fh_log, LOCK_UN);
+	fclose($fh_log);
+}
+
+/* ------------------------------------------------------------------------ */
+
+function
+remove_old()
+{
+	global $OUT_DIR, $MAX_OUTPUT_FILES;
+
+	$files = array();
+	foreach (glob("$OUT_DIR/*.pdf") as $file)
+		if (is_file($file)) /* We don't expect anything else here */
+			$files[$file] = filemtime($file);
+
+	asort($files);
+	if (($reduce_num = count($files) - $MAX_OUTPUT_FILES) > 0) {
+		array_splice($files, $reduce_num);
+		foreach ($files as $file => $mtime) {
+			@unlink($file);
+		}
+	}
+}
+
+/* ------------------------------------------------------------------------ */
+
+function
+generate_pdf($url, $output_file)
+{
+	global $PRINCE, $prince_skip, $mail_to;
+
+	exec("$PRINCE -v $url -o $output_file ".
+	     "--pdf-creator=\"$mail_to\" 2>&1", $lines_prince);
+	if (!process_command_output($lines_prince, basename($output_file),
+				    $prince_skip)) {
+		flog("Failed creation of the document $output_file.\n");
+		return ST_GENERATION_ERROR;
+	}
+
+	return ST_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+
+function
+optimize_pdf($input_file, $output_file)
+{
+	global $MULTIVALENT, $PDFSIZEOPT, $PDFSIZEOPT_OPTS, $pdfsizeopt_skip,
+	       $pdfsizeopt_skip_regs;
+
+	exec("CLASSPATH=$MULTIVALENT $PDFSIZEOPT $PDFSIZEOPT_OPTS ".
+	     "$input_file $output_file 2>&1", $lines_opt);
+	if (!process_command_output($lines_opt, basename($output_file),
+				    $pdfsizeopt_skip,
+				    $pdfsizeopt_skip_regs)) {
+		flog("Failed optimization of the document $output_file.\n");
+		return ST_OPTIMIZATION_ERROR;
+	}
+
+	return ST_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+
+function
+http_notify($publish_path)
+{
+	global $REPORT_URL, $REPORT_REPLY, $notification_error;
+
+	$ret = ST_OK;
+
+	list($content, $status, $headers) =
+		http_req(POST, $REPORT_URL, "url=". urlencode($publish_path));
+	if ($status === false) { /* Internal error */
+		flog("Internal error on sending notification.\n");
+		$ret = ST_INTERNAL_ERROR2;
+	} else if ($status != 200) {
+		$notification_error = "Bad notification status: $status.\n";
+		flog($notification_error);
+		$ret = ST_NOTIFICATION_ERROR;
+	} else if ($content != $REPORT_REPLY) {
+		$notification_error = "Unexpected notification reply \"".
+		     str_replace("\n", "@", $content). "\".\n";
+		flog($notification_error);
+		$ret = ST_NOTIFICATION_ERROR;
+	}
+
+	return $ret;
+}
+
+/* ------------------------------------------------------------------------ */
+
+function
+mail_notify($ret)
+{
+	global $statuses, $notification_error;
+
+	if (isset($statuses[$ret]))
+		$status = $statuses[$ret];
+	else
+		$status = "Unknown status";
+
+	send_mail($status, "$status.\n".
+		  ($ret == ST_NOTIFICATION_ERROR ? $notification_error : ""));
+}
+
+/* ---------------------------- Main -------------------------------------- */
+
+date_default_timezone_set($server_timezone);
+
+if (($ret = init_log_and_lock()) != ST_OK)
+	goto err0;
+
+$ret = ST_INTERNAL_ERROR3;
+
+putenv("PATH=". getenv("PATH"). ":/usr/local/bin");
+set_time_limit($TTL);
+
+$file_name = strftime("html5-%Y%m%d%H%M%S.pdf");
+flog("Starting creating the document $SITE_URL$EXPORT_DIR/$file_name.\n");
+
+if (!($temp_dir = mkdtemp("makepdf-")))
+	goto err1;
+
+$old_cwd = getcwd();
+if (!@chdir($temp_dir)) {
+	flog("Can't change directory to \"$temp_dir\".\n");
+	goto err2;
+}
+
+$generated_file = "$temp_dir/prince-$file_name";
+if (($ret = generate_pdf($SOURCE_URL, $generated_file)) != ST_OK)
+	goto err2;
+
+$optimized_file = "$temp_dir/pdfsizeopt-$file_name";
+if (($ret = optimize_pdf($generated_file, $optimized_file)) != ST_OK)
+	goto err2;
+
+$output_file = "$OUT_DIR/$file_name";
+if (!@rename($optimized_file, $output_file)) {
+	flog("Can't rename output file.\n");
+	$ret = ST_INTERNAL_ERROR4;
+	goto err2;
+}
+
+$ret = http_notify("$EXPORT_DIR/$file_name");
+remove_old(); /* Ignoring errors */
+
+err2:
+
+chdir($old_cwd);
+rrmdir($temp_dir);
+
+err1:
+
+flog("Finishing creating the document $SITE_URL$EXPORT_DIR/$file_name.\n");
+close_log_and_unlock();
+
+err0:
+
+mail_notify($ret);
+exit($ret);
+
+?>
