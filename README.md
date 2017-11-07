@@ -39,7 +39,7 @@ It consists of:
    and exits.
 3) If no other instance is running, the script forks and runs as a designated
    user the `makepdf` script (by using `sudo`).
-4) The script runs `prince` to donwload HTML-document to be converted, and
+4) The script runs `prince` to download HTML-document to be converted, and
    generates non-optimized version. If `prince` prints any unknown or error
    message, the generation is aborted and corresponding e-mail is sent.
 5) Next the `makepdf` runs `pdfsizeopt` tool to reduce the size of generated
