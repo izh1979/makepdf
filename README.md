@@ -95,6 +95,13 @@ Multivalent is an optional component that is used by Prince. You can get it here
 * http://multivalent.sourceforge.net/
 * https://downloads.sourceforge.net/project/multivalent/multivalent/Release20091027/Multivalent20091027.jar
 
+To enable Multivalent usage you need:
+* Install Multivalent JAR to some path.
+* Adjust `$MULTIVALENT` variable in `makepdf` script to point to JAR path. E.g.:
+  `$MULTIVALENT = "/opt/pdfsizeopt/Multivalent.jar";`.
+* Set `--use-multivalent=true` option in `$PDFSIZEOPT_OPTS` in `makepdf` script. E.g.:
+  `$PDFSIZEOPT_OPTS = "--use-pngout=true --use-jbig2=true --use-multivalent=true";`
+
 #### pngout
 
 The pngout tool is used for loseless PNG-images compression. Please read
